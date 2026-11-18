@@ -15,6 +15,7 @@ use dynamo_backend_common::{BackendError, DisaggregationMode, DynamoError, Error
 use dynamo_sidecar_common::{
     DEFAULT_MAX_GRPC_MESSAGE_SIZE, GrpcChannelPool, GrpcEndpoint, GrpcTransportConfig,
 };
+use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::time::{Instant, timeout_at};
@@ -327,17 +328,34 @@ pub struct Pool {
 }
 
 impl Pool {
+    /// Splits `cfg.connections` over `uris`, at least one each, and interleaves
+    /// them so round-robin streams rotate over the endpoints. The control
+    /// client is on `uris[0]`.
     // bootstrap=false: Pool::connect's only call site is LLMEngine::start
     // (lib/sidecar/sglang/src/engine.rs), after the tracing subscriber is
     // installed. See connect()'s own doc comment.
     pub async fn connect(
-        uri: &GrpcEndpoint,
+        uris: &[GrpcEndpoint],
         cfg: &GrpcTransportConfig,
         deadline: Instant,
     ) -> Result<Self, DynamoError> {
-        let pool = connect_pool(uri, *cfg, deadline, false).await?;
-        let clients = (0..pool.len())
-            .map(|_| client_from_channel(pool.next_channel()))
+        let per_endpoint = NonZeroUsize::new(cfg.connections.get().div_ceil(uris.len()))
+            .unwrap_or(NonZeroUsize::MIN);
+        let cfg = GrpcTransportConfig {
+            connections: per_endpoint,
+            ..*cfg
+        };
+        let pools = try_join_all(
+            uris.iter()
+                .map(|uri| connect_pool(uri, cfg, deadline, false)),
+        )
+        .await?;
+        let clients = (0..per_endpoint.get())
+            .flat_map(|_| {
+                pools
+                    .iter()
+                    .map(|pool| client_from_channel(pool.next_channel()))
+            })
             .collect();
         Ok(Self {
             clients,

@@ -41,6 +41,8 @@ const RETRY_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct SglangSidecarEngine {
     endpoint: GrpcEndpoint,
+    /// One per SGLang tokenizer worker; the first is `endpoint`.
+    tokenizer_worker_endpoints: Vec<GrpcEndpoint>,
     transport: GrpcTransportConfig,
     disaggregation_mode: DisaggregationMode,
     bootstrap_host: Option<String>,
@@ -157,6 +159,8 @@ impl SglangSidecarEngine {
     ) -> Result<(Self, WorkerConfig), DynamoError> {
         Self::validate_args(&args)?;
         let endpoint = args.sidecar.grpc_endpoint;
+        let tokenizer_worker_endpoints =
+            tokenizer_worker_endpoints(&endpoint, args.grpc_tokenizer_workers.get())?;
         let transport = args.sidecar.grpc.config();
         let disaggregation_mode = client::discovery_mode(&discovery.server_info)?;
         let bootstrap_host = if disaggregation_mode.is_prefill() {
@@ -221,6 +225,7 @@ impl SglangSidecarEngine {
         Ok((
             Self {
                 endpoint,
+                tokenizer_worker_endpoints,
                 transport,
                 disaggregation_mode,
                 bootstrap_host,
@@ -280,6 +285,35 @@ impl SglangSidecarEngine {
     }
 }
 
+/// SGLang tokenizer worker `i` serves native gRPC on the first worker's port plus `i`.
+fn tokenizer_worker_endpoints(
+    first: &GrpcEndpoint,
+    count: usize,
+) -> Result<Vec<GrpcEndpoint>, DynamoError> {
+    if count == 1 {
+        return Ok(vec![first.clone()]);
+    }
+    let mut url = url::Url::parse(first.as_str())
+        .ok()
+        .filter(|url| url.scheme() == "http")
+        .ok_or_else(|| {
+            client::invalid_arg("--grpc-tokenizer-workers > 1 requires a TCP --grpc-endpoint")
+        })?;
+    let port = url.port_or_known_default().unwrap_or(80);
+    (0..count)
+        .map(|i| {
+            let worker_port = u16::try_from(usize::from(port) + i).map_err(|_| {
+                client::invalid_arg(format!(
+                    "--grpc-endpoint port {port} plus {count} tokenizer workers exceeds 65535"
+                ))
+            })?;
+            url.set_port(Some(worker_port))
+                .map_err(|()| client::invalid_arg("cannot set tokenizer worker gRPC port"))?;
+            GrpcEndpoint::parse(url.as_str(), "--grpc-endpoint")
+        })
+        .collect()
+}
+
 #[async_trait]
 impl LLMEngine for SglangSidecarEngine {
     async fn start(&self, _worker_id: u64) -> Result<EngineConfig, DynamoError> {
@@ -288,7 +322,8 @@ impl LLMEngine for SglangSidecarEngine {
         }
 
         let deadline = Instant::now() + self.transport.startup_deadline;
-        let pool = Pool::connect(&self.endpoint, &self.transport, deadline).await?;
+        let pool =
+            Pool::connect(&self.tokenizer_worker_endpoints, &self.transport, deadline).await?;
         let mut control = pool.control_client();
         self.await_ready(&mut control, deadline).await?;
         let discovery = client::discover(&mut control, deadline).await?;
@@ -1278,7 +1313,7 @@ mod tests {
         SglangSidecarEngine, build_engine_config, combined_token_limit, discover_kv_event_sources,
         discovery_bootstrap_port, engine_sets_chat_template_defaults,
         hicache_native_offloading_capacity, kv_event_connect_host, omitted_max_tokens_default,
-        resolve_bootstrap_host_with_local, sglang_eagle_enabled,
+        resolve_bootstrap_host_with_local, sglang_eagle_enabled, tokenizer_worker_endpoints,
     };
 
     fn discovery(server_info: serde_json::Value) -> Discovery {
@@ -1986,6 +2021,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("--bootstrap-host"));
+    }
+
+    #[test]
+    fn tokenizer_worker_endpoints_use_consecutive_ports() {
+        let first = GrpcEndpoint::parse("127.0.0.1:30001", "--grpc-endpoint").unwrap();
+        let endpoints: Vec<String> = tokenizer_worker_endpoints(&first, 3)
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            endpoints,
+            [
+                "http://127.0.0.1:30001",
+                "http://127.0.0.1:30002",
+                "http://127.0.0.1:30003"
+            ]
+        );
+        let last = GrpcEndpoint::parse("127.0.0.1:65535", "--grpc-endpoint").unwrap();
+        assert!(tokenizer_worker_endpoints(&last, 2).is_err());
+        let unix = GrpcEndpoint::parse("unix:///tmp/sglang.sock", "--grpc-endpoint").unwrap();
+        assert_eq!(
+            tokenizer_worker_endpoints(&unix, 1).unwrap(),
+            [unix.clone()]
+        );
+        assert!(tokenizer_worker_endpoints(&unix, 2).is_err());
     }
 
     #[test]
