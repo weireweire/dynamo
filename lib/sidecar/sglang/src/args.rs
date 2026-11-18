@@ -37,13 +37,9 @@ pub struct Args {
     )]
     pub native_http_max_event_bytes: NonZeroUsize,
 
-    /// Number of SGLang tokenizer workers (`--tokenizer-worker-num`). Each one
-    /// serves native gRPC on its own port, `--grpc-endpoint`'s port plus its
-    /// index; generate streams are spread over all of them.
-    #[arg(
-        long,
-        env = "DYN_SGLANG_GRPC_TOKENIZER_WORKERS",
-        default_value_t = NonZeroUsize::MIN
-    )]
-    pub grpc_tokenizer_workers: NonZeroUsize,
+    /// SGLang tokenizer workers sharing the gRPC port (`--tokenizer-worker-num`).
+    /// The sidecar spreads its `--grpc-connections` evenly over them. Defaults
+    /// to the count SGLang reports.
+    #[arg(long, env = "DYN_SGLANG_GRPC_TOKENIZER_WORKERS")]
+    pub grpc_tokenizer_workers: Option<NonZeroUsize>,
 }

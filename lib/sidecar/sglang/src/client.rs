@@ -3,7 +3,7 @@
 
 //! Thin sidecar client for SGLang's native `sglang.runtime.v1.SglangService`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -15,10 +15,9 @@ use dynamo_backend_common::{BackendError, DisaggregationMode, DynamoError, Error
 use dynamo_sidecar_common::{
     DEFAULT_MAX_GRPC_MESSAGE_SIZE, GrpcChannelPool, GrpcEndpoint, GrpcTransportConfig,
 };
-use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep, timeout_at};
 use tonic::transport::Channel;
 
 use crate::proto as pb;
@@ -293,6 +292,78 @@ pub async fn connect(
     Ok(client_from_channel(pool.next_channel()))
 }
 
+const TOKENIZER_WORKER_ID_KEY: &str = "tokenizer_worker_id";
+/// How long to keep reconnecting until every tokenizer worker holds its share
+/// of connections; workers start listening within seconds of each other.
+const BALANCE_BUDGET: Duration = Duration::from_secs(120);
+
+/// SGLang tokenizer workers share one SO_REUSEPORT port and the kernel picks
+/// the worker per connection, so connect one at a time, ask each connection
+/// which worker serves it, and keep `connections / workers` per worker.
+/// Returns the clients interleaved by worker.
+async fn connect_balanced(
+    uri: &GrpcEndpoint,
+    cfg: &GrpcTransportConfig,
+    deadline: Instant,
+    workers: usize,
+) -> Result<Vec<Client>, DynamoError> {
+    let per_worker = cfg.connections.get().div_ceil(workers);
+    let single = GrpcTransportConfig {
+        connections: NonZeroUsize::MIN,
+        ..*cfg
+    };
+    let balance_deadline = deadline.min(Instant::now() + BALANCE_BUDGET);
+    let mut by_worker: BTreeMap<String, Vec<Client>> = BTreeMap::new();
+    let mut surplus = 0_usize;
+    while by_worker.len() < workers || by_worker.values().any(|c| c.len() < per_worker) {
+        if Instant::now() >= balance_deadline {
+            tracing::warn!(
+                expected_workers = workers,
+                reached_workers = by_worker.len(),
+                per_worker,
+                "SGLang tokenizer workers not all reachable over the shared gRPC port; \
+                 continuing with the connections opened so far"
+            );
+            break;
+        }
+        let pool = connect_pool(uri, single, deadline, false).await?;
+        let mut client = client_from_channel(pool.next_channel());
+        let info = get_server_info(&mut client, deadline).await?;
+        let worker = info
+            .get(TOKENIZER_WORKER_ID_KEY)
+            .map(Value::to_string)
+            .ok_or_else(|| {
+                invalid_arg(format!(
+                    "--grpc-tokenizer-workers {workers} needs an SGLang server that reports \
+                     {TOKENIZER_WORKER_ID_KEY} in GetServerInfo"
+                ))
+            })?;
+        let slots = by_worker.entry(worker).or_default();
+        if slots.len() < per_worker {
+            slots.push(client);
+        } else {
+            surplus += 1;
+            // Workers still starting are not listening yet; back off instead
+            // of spinning on the ones that are.
+            if surplus % (4 * workers) == 0 {
+                sleep(cfg.retry_interval).await;
+            }
+        }
+    }
+    tracing::info!(
+        workers = by_worker.len(),
+        per_worker,
+        discarded = surplus,
+        "spread SGLang gRPC connections over tokenizer workers"
+    );
+    let mut slots: Vec<_> = by_worker.into_values().collect();
+    let mut clients = Vec::with_capacity(per_worker * slots.len());
+    for index in 0..per_worker {
+        clients.extend(slots.iter_mut().filter_map(|c| c.get(index).cloned()));
+    }
+    Ok(clients)
+}
+
 /// `GrpcChannelPool` starts its own deadline from `cfg.startup_deadline`;
 /// `deadline` also bounds it, because callers start their startup budget
 /// before connecting.
@@ -328,35 +399,23 @@ pub struct Pool {
 }
 
 impl Pool {
-    /// Splits `cfg.connections` over `uris`, at least one each, and interleaves
-    /// them so round-robin streams rotate over the endpoints. The control
-    /// client is on `uris[0]`.
     // bootstrap=false: Pool::connect's only call site is LLMEngine::start
     // (lib/sidecar/sglang/src/engine.rs), after the tracing subscriber is
     // installed. See connect()'s own doc comment.
     pub async fn connect(
-        uris: &[GrpcEndpoint],
+        uri: &GrpcEndpoint,
         cfg: &GrpcTransportConfig,
         deadline: Instant,
+        tokenizer_workers: NonZeroUsize,
     ) -> Result<Self, DynamoError> {
-        let per_endpoint = NonZeroUsize::new(cfg.connections.get().div_ceil(uris.len()))
-            .unwrap_or(NonZeroUsize::MIN);
-        let cfg = GrpcTransportConfig {
-            connections: per_endpoint,
-            ..*cfg
+        let clients = if tokenizer_workers.get() == 1 {
+            let pool = connect_pool(uri, *cfg, deadline, false).await?;
+            (0..pool.len())
+                .map(|_| client_from_channel(pool.next_channel()))
+                .collect()
+        } else {
+            connect_balanced(uri, cfg, deadline, tokenizer_workers.get()).await?
         };
-        let pools = try_join_all(
-            uris.iter()
-                .map(|uri| connect_pool(uri, cfg, deadline, false)),
-        )
-        .await?;
-        let clients = (0..per_endpoint.get())
-            .flat_map(|_| {
-                pools
-                    .iter()
-                    .map(|pool| client_from_channel(pool.next_channel()))
-            })
-            .collect();
         Ok(Self {
             clients,
             next: AtomicUsize::new(0),
